@@ -21,8 +21,15 @@ use App\Models\Client;
 use App\Models\Link;
 use App\Models\Order;
 use App\Models\OrdersProduct;
+use App\Services\OrderService;
+use App\Services\ProductService;
+use Exception;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\ValidationException;
+use Purchase;
+use Throwable;
+use const JSON_PRETTY_PRINT;
+use const JSON_UNESCAPED_UNICODE;
 
 class PixelLogProcessor
 {
@@ -56,9 +63,9 @@ class PixelLogProcessor
 
             $this->pixel_log->status = null;
         } catch (ValidationException $e) {
-            $this->pixel_log->status = json_encode($e->errors(), \JSON_PRETTY_PRINT | \JSON_UNESCAPED_UNICODE);
+            $this->pixel_log->status = json_encode($e->errors(), JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
             logger()->warning('e', $e->errors());
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             $this->pixel_log->status = $e->getMessage();
             logger()->warning($e->getMessage());
             logger('Пойман Exception в pixel_log #' . $this->pixel_log->id, [$e]);
@@ -72,12 +79,12 @@ class PixelLogProcessor
      * Проверяем, существует ли такой clientId
      * Если нет - создаем
      *
-     * @return \App\Models\Client|false
+     * @return Client|false
      */
     public function parseClientId()
     {
         if (empty($this->pixel_log->data['uid'])) {
-            throw new \Exception('Пустой uid');
+            throw new Exception('Пустой uid');
         }
 
         $this->client = Client::where('id', '=', $this->pixel_log->data['uid'])->first() ?? new Client();
@@ -98,7 +105,7 @@ class PixelLogProcessor
             ->first();
 
         if (!$this->link) {
-            throw new \Exception('Не найден линк #' . $this->pixel_log->data['utm_campaign'] . ' у партнера #' . $this->pixel_log->data['utm_content']);
+            throw new Exception('Не найден линк #' . $this->pixel_log->data['utm_campaign'] . ' у партнера #' . $this->pixel_log->data['utm_content']);
         }
         return $this->link;
     }
@@ -112,7 +119,7 @@ class PixelLogProcessor
         }
 
         if (!$this->link) {
-            throw new \Exception('Не найден линк #' . $this->pixel_log->data['utm_campaign'] . ' у партнера #' . $this->pixel_log->data['utm_content']);
+            throw new Exception('Не найден линк #' . $this->pixel_log->data['utm_campaign'] . ' у партнера #' . $this->pixel_log->data['utm_content']);
         }
 
         // Тут мы проверяем, что данная запись не существовала до этого в таблице clicks
@@ -158,7 +165,7 @@ class PixelLogProcessor
         } else {
             logger()->debug('Это странный заказ');
             dump($this->pixel_log->data);
-            throw new \Exception('Странный формат заказа!');
+            throw new Exception('Странный формат заказа!');
         }
     }
 
@@ -175,7 +182,7 @@ class PixelLogProcessor
         $order->pp_id = $this->pixel_log->pp_id;
         $order->partner_id = $this->link->partner_id;
         $order->link_id = $this->link->id;
-        $order->click_id = $this->pixel_log->data['click_id'] ?? null;
+        $order->click_id = $this->pixel_log->getClickId() ?? null;
         $order->web_id = $this->pixel_log->data['utm_term'] ?? null;
         $order->offer_id = $this->link->offer_id;
         $order->client_id = $this->client->id;
@@ -183,138 +190,47 @@ class PixelLogProcessor
         $order->status = 'new';
         $order->save();
 
-        $this->pixel_log->is_order = true;
+        $this->orderComplete();
 
         logger()->debug('Это продажа');
     }
 
+
     /**
-     * @noinspection PhpUndefinedMethodInspection
-     * @noinspection PhpUndefinedClassInspection
-     * @noinspection PhpUndefinedFunctionInspection
+     * Обработка события заказа
+     * @param ProductService $productService
+     * @return bool
      */
-    public function parseDataLayerEvent()
+    public function parseDataLayerEvent(ProductService $productService): bool
     {
-        $events = $this->pixel_log->data['dataLayer'];
-
-        if (!is_array($events)) {
-            throw new \Exception('dataLayer is not an array');
-        }
-        foreach ($events as $event) {
-            if (!isset($event['event'])) {
-                continue;
+        // свои переменные называю в кемл кейс, за исключение полей элоквент в команде следую принятому стандарту
+        // рефакторинг достаточно поверхностный, так как без контекста
+        foreach ($this->pixel_log->getEvents() as $event) {
+            if (!isset($event['event']) && !empty($event['ecommerce']['purchase'])) {
+                continue; // возможно тут должно быть исключение
             }
-            if (!isset($event['ecommerce'])) {
-                continue;
-            }
-            if (!isset($event['ecommerce']['purchase'])) {
-                continue;
-            }
+            /** @var Purchase $purchase */
             $purchase = $event['ecommerce']['purchase'];
+            $purchase->validate();
+            $orderService = new OrderService($this->pixel_log, $this->link, $this->client);
+            $order = $orderService->createOrUpdateOrder($purchase);
 
-            $validator = Validator::make($purchase, [
-                'products.*.id' => 'required|string',
-                'products.*.name' => 'required|string',
-                'products.*.price' => 'required|numeric',
-                'products.*.variant' => 'nullable|string',
-                'products.*.category' => 'nullable|string',
-                'products.*.quantity' => 'nullable|numeric|min:1',
-                'actionField.id' => 'required|string',
-                'actionField.action' => 'nullable|string|in:purchase',
-                'actionField.revenue' => 'required|numeric',
-            ]);
-
-            if ($validator->fails()) {
-                logger()->debug('Ошибка валидации заказа');
-                throw new ValidationException($validator);
+            foreach ($purchase->getProducts() as $product_data) {
+                $productService->productOrdered($order, $product_data, $this->pixel_log->pp_id);
             }
-
-            $order_id = $purchase['actionField']['id'];
-            $order = Order::query()
-                ->where('pp_id', '=', $this->pixel_log->pp_id)
-                ->where('order_id', '=', $order_id)
-                ->first();
-
-            if (!$order) {
-                logger()->debug('Заказ №' . $order_id . ' не существует, создаем');
-                $order = new Order();
-                $order->pp_id = $this->pixel_log->pp_id;
-                $order->order_id = $order_id;
-                $order->status = 'new';
-            } else {
-                logger()->debug('Заказ №' . $order_id . ' существует, обновляем');
-            }
-            $order->pixel_id = $this->pixel_log->id;
-            $order->datetime = $this->pixel_log->created_at;
-            $order->partner_id = $this->link->partner_id;
-            $order->link_id = $this->link->id;
-            $order->click_id = $this->pixel_log->data['click_id'] ?? null;
-            $order->web_id = $this->pixel_log->data['utm_term'] ?? null;
-            $order->offer_id = $this->link->offer_id;
-            $order->client_id = $this->client->id;
-            $order->gross_amount = 0;
-            foreach ($purchase['products'] as $product_data) {
-                $order->gross_amount += $product_data['price'] * ($product_data['quantity'] ?? 1);
-            }
-            // $order->gross_amount = $purchase['actionField']['revenue'] - ($purchase['actionField']['shipping'] ?? 0);
-            $order->cnt_products = count($purchase['products']);
-            $order->save();
-
-            logger()->debug('Найдено продуктов: ' . count($purchase['products']));
-            foreach ($purchase['products'] as $product_data) {
-                $product_id = $product_data['id'];
-                $product = OrdersProduct::query()
-                        ->where('pp_id', '=', $this->pixel_log->pp_id)
-                        ->where('order_id', '=', $order->order_id)
-                        ->where('product_id', '=', $product_id)
-                        ->first() ?? new OrdersProduct();
-
-                // if ($product->wasRecentlyCreated === false) {
-                //     if (!is_null($product->reestr_id)) {
-                //         return;
-                //     }
-                //     if ($product->status !== 'new') {
-                //         return;
-                //     }
-                // }
-
-                $product->pp_id = $this->pixel_log->pp_id;
-                $product->order_id = $order->order_id;
-                $product->parent_id = Order::query()
-                    ->where('pp_id', '=', $this->pixel_log->pp_id)
-                    ->where('order_id', '=', $order_id)
-                    ->first()->id;
-                $product->datetime = $order->datetime;
-                $product->partner_id = $order->partner_id;
-                $product->offer_id = $order->offer_id;
-                $product->link_id = $order->link_id;
-                $product->product_id = $product_id;
-                $product->product_name = trim(($product_data['name'] ?? '') . ' ' . ($product_data['variant'] ?? ''));
-                $product->category = $product_data['category'] ?? null;
-                $product->price = $product_data['price'];
-                $product->quantity = $product_data['quantity'] ?? 1;
-                $product->total = $product->price * $product->quantity;
-                $product->web_id = $order->web_id;
-                $product->click_id = $order->click_id;
-                $product->pixel_id = $order->pixel_id;
-                $product->amount = 0;
-                $product->amount_advert = 0;
-                $product->fee_advert = 0;
-                $product->save();
-                logger()->debug('Сохранен продукт: ' . $product->product_name);
-            }
-            $this->pixel_log->is_order = true;
-            return true;
         }
+        return $this->orderComplete();  // не уверен что угадал с названием метода
     }
 
+    /**
+     *
+     */
     public function parseCheckoutDataLayerEvent()
     {
-        $events = $this->pixel_log->data['dataLayer'];
+        // будет содержать больше комментариев, чем обычно, чтоб проще было читать тестовое задание
+        // лично я именую всё в кэмл кейс, кроме полей моделей в ларавель, но не буду с этим заморачиваться тут
+        $events = $this->pixel_log->getEvents(); // всегда возвращает массив, что упраздняет проверку на массив
 
-        if (!is_array($events)) {
-            throw new \Exception('dataLayer is not an array');
-        }
         foreach ($events as $event) {
             if (!isset($event['event'])) {
                 continue;
@@ -342,35 +258,14 @@ class PixelLogProcessor
             }
 
             $order_id = $this->pixel_log->data['ed']['order_id'];
-            $order = Order::query()
-                ->where('pp_id', '=', $this->pixel_log->pp_id)
-                ->where('order_id', '=', $order_id)
-                ->first();
+            $order = $this->getOrder($order_id);
 
             if (!$order) {
-                logger()->debug('Заказ №' . $order_id . ' не существует, создаем');
-                $order = new Order();
-                $order->pp_id = $this->pixel_log->pp_id;
-                $order->order_id = $order_id;
-                $order->status = 'new';
+                $order = $this->createNewOrder($order_id);
             } else {
                 logger()->debug('Заказ №' . $order_id . ' существует, обновляем');
             }
-            $order->pixel_id = $this->pixel_log->id;
-            $order->datetime = $this->pixel_log->created_at;
-            $order->partner_id = $this->link->partner_id;
-            $order->link_id = $this->link->id;
-            $order->click_id = $this->pixel_log->data['click_id'] ?? null;
-            $order->web_id = $this->pixel_log->data['utm_term'] ?? null;
-            $order->offer_id = $this->link->offer_id;
-            $order->client_id = $this->client->id;
-            $order->gross_amount = 0;
-            foreach ($purchase['products'] as $product_data) {
-                $order->gross_amount += $product_data['price'] * ($product_data['quantity'] ?? 1);
-            }
-            // $order->gross_amount = $purchase['actionField']['revenue'] - ($purchase['actionField']['shipping'] ?? 0);
-            $order->cnt_products = count($purchase['products']);
-            $order->save();
+            $product_data = $this->updateOrder($order, $purchase['products']);
 
             logger()->debug('Найдено продуктов: ' . count($purchase['products']));
             foreach ($purchase['products'] as $product_data) {
@@ -402,8 +297,18 @@ class PixelLogProcessor
                 $product->save();
                 logger()->debug('Сохранен продукт: ' . $product->product_name);
             }
-            $this->pixel_log->is_order = true;
+            $this->orderComplete();
             return true;
         }
     }
+
+    /**
+     * @return bool
+     */
+    private function orderComplete(): bool
+    {
+        $this->pixel_log->is_order = true;
+        return true;
+    }
+
 }
